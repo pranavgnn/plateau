@@ -1,11 +1,13 @@
 """Type-safe dataset loader for license plate detection."""
 
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Optional, TypeAlias
 from pathlib import Path
 import cv2
 import numpy as np
 from lxml import etree
 import kagglehub
+
+Sample: TypeAlias = Tuple[np.ndarray, np.ndarray, str]
 
 class BoundingBox:
     """Represents normalized bounding box."""
@@ -21,13 +23,27 @@ class BoundingBox:
         return np.array([self.xmin, self.ymin, self.xmax, self.ymax], dtype=np.float32)
 
 
+def _clip_box(xmin: float, ymin: float, xmax: float, ymax: float) -> BoundingBox:
+    """Clamp bbox to valid normalized range and keep corners ordered."""
+    xmin_clamped = float(np.clip(xmin, 0.0, 1.0))
+    ymin_clamped = float(np.clip(ymin, 0.0, 1.0))
+    xmax_clamped = float(np.clip(xmax, 0.0, 1.0))
+    ymax_clamped = float(np.clip(ymax, 0.0, 1.0))
+
+    left = min(xmin_clamped, xmax_clamped)
+    top = min(ymin_clamped, ymax_clamped)
+    right = max(xmin_clamped, xmax_clamped)
+    bottom = max(ymin_clamped, ymax_clamped)
+    return BoundingBox(left, top, right, bottom)
+
+
 class LicensePlateDataset:
     """Load Indian vehicle license plate dataset from kagglehub."""
     
     def __init__(self, dataset_id: str = "saisirishan/indian-vehicle-dataset"):
         self.dataset_id = dataset_id
         self.dataset_path: Optional[Path] = None
-        self.samples: List[Tuple[np.ndarray, BoundingBox, str]] = []
+        self.samples: List[Sample] = []
         
     def download(self) -> Path:
         """Download dataset from kagglehub."""
@@ -86,14 +102,14 @@ class LicensePlateDataset:
             name_elem = obj.find("name")
             plate_text = name_elem.text if name_elem is not None else None
             
-            bbox = BoundingBox(xmin_norm, ymin_norm, xmax_norm, ymax_norm)
+            bbox = _clip_box(xmin_norm, ymin_norm, xmax_norm, ymax_norm)
             return bbox, plate_text
             
         except Exception as e:
             print(f"Error parsing {xml_path}: {e}")
             return None, None
     
-    def load(self, img_shape: Tuple[int, int] = (224, 224)) -> List[Tuple[np.ndarray, np.ndarray, str]]:
+    def load(self, img_shape: Tuple[int, int] = (224, 224), augment: bool = False) -> List[Sample]:
         """Load images and bboxes. Returns (image, bbox_array, plate_text)."""
         if self.dataset_path is None:
             self.download()
@@ -132,6 +148,14 @@ class LicensePlateDataset:
                     img = img.astype(np.float32) / 255.0
                     
                     self.samples.append((img, bbox.to_array(), plate_text))
+
+                    if augment:
+                        flipped_img = np.ascontiguousarray(img[:, ::-1, :])
+                        flipped_bbox = np.array(
+                            [1.0 - bbox.xmax, bbox.ymin, 1.0 - bbox.xmin, bbox.ymax],
+                            dtype=np.float32,
+                        )
+                        self.samples.append((flipped_img, flipped_bbox, plate_text))
                 except Exception as e:
                     print(f"Error loading {img_file}: {e}")
                     continue

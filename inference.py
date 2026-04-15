@@ -1,6 +1,7 @@
 """Type-safe inference script for license plate detection."""
 
 from typing import Tuple, List
+from pathlib import Path
 import cv2
 import numpy as np
 from model import LicensePlateDetectionModel
@@ -36,13 +37,18 @@ class PlateDetector:
         # Predict
         img_batch = np.expand_dims(img_normalized, axis=0)
         bbox = self.detector.predict(img_batch)[0]
+
+        xmin = float(np.clip(min(bbox[0], bbox[2]), 0.0, 1.0))
+        ymin = float(np.clip(min(bbox[1], bbox[3]), 0.0, 1.0))
+        xmax = float(np.clip(max(bbox[0], bbox[2]), 0.0, 1.0))
+        ymax = float(np.clip(max(bbox[1], bbox[3]), 0.0, 1.0))
         
         # Denormalize to original image size
         bbox_original = np.array([
-            bbox[0] * w,
-            bbox[1] * h,
-            bbox[2] * w,
-            bbox[3] * h
+            xmin * w,
+            ymin * h,
+            xmax * w,
+            ymax * h
         ], dtype=int)
         
         return original_img, bbox_original.tolist()
@@ -119,7 +125,11 @@ def batch_detect(
 # Example usage
 if __name__ == "__main__":
     # Initialize detector
-    detector = PlateDetector("license_plate_detector.h5")
+    model_path = Path("license_plate_detector.keras")
+    if not model_path.exists():
+        model_path = Path("license_plate_detector.h5")
+
+    detector = PlateDetector(str(model_path))
     
     # Single image detection
     image_path = "path/to/image.png"  # Replace with actual image path

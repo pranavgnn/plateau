@@ -2,10 +2,11 @@
 
 from typing import Tuple
 import numpy as np
+from tensorflow import keras
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from dataset_loader import LicensePlateDataset
-from model import LicensePlateDetectionModel, IoULoss
+from model import LicensePlateDetectionModel, BoxRegressionLoss, BoundingBoxMetric
 
 
 def visualize_predictions(
@@ -64,7 +65,7 @@ def main() -> None:
     # Load dataset
     print("1. Loading dataset...")
     dataset = LicensePlateDataset(dataset_id="saisirishan/indian-vehicle-dataset")
-    dataset.load(img_shape=(224, 224))
+    dataset.load(img_shape=(224, 224), augment=True)
     
     images, bboxes, plate_texts = dataset.get_arrays()
     print(f"Images: {images.shape}, Bboxes: {bboxes.shape}")
@@ -82,36 +83,54 @@ def main() -> None:
     # Build model
     print("\n3. Building model...")
     detector = LicensePlateDetectionModel(input_shape=(224, 224, 3))
-    model = detector.build()
+    detector.build()
     detector.get_summary()
     
-    # Compile with MSE loss (can swap for IoULoss)
+    # Phase 1: train head while backbone frozen
     print("\n4. Compiling model...")
+    detector.set_backbone_trainable(False)
     detector.compile(
-        loss='mse',  # Or use IoULoss() for better bbox predictions
-        metrics=['mae']
+        optimizer=None,
+        loss=BoxRegressionLoss(),
+        metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
     )
     
-    # Train
-    print("\n5. Training model...")
-    history = detector.train(
+    print("\n5. Training head..." )
+    detector.train(
         x_train, y_train,
         x_val=x_val, y_val=y_val,
-        epochs=50,
+        epochs=15,
         batch_size=16
+    )
+
+    # Phase 2: fine-tune top backbone layers with lower LR
+    print("\n6. Fine-tuning backbone...")
+    detector.set_backbone_trainable(True, fine_tune_at=180)
+    detector.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+        loss=BoxRegressionLoss(),
+        metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
+    )
+    detector.train(
+        x_train,
+        y_train,
+        x_val=x_val,
+        y_val=y_val,
+        epochs=20,
+        batch_size=16,
     )
     
     # Evaluate
-    print("\n6. Evaluating on test set...")
-    test_loss, test_mae = detector.model.evaluate(x_test, y_test)
-    print(f"Test Loss: {test_loss:.4f}, Test MAE: {test_mae:.4f}")
+    print("\n7. Evaluating on test set...")
+    test_loss, test_iou, test_mae = detector.model.evaluate(x_test, y_test, verbose=0)
+    print(f"Test Loss: {test_loss:.4f}, Test IoU: {test_iou:.4f}, Test MAE: {test_mae:.4f}")
     
     # Save model
-    print("\n7. Saving model...")
-    detector.save('license_plate_detector.h5')
+    print("\n8. Saving model...")
+    detector.save('license_plate_detector.keras')
     
     # Visualize predictions
-    print("\n8. Visualizing predictions...")
+    print("\n9. Visualizing predictions...")
     pred_test = detector.predict(x_test)
     visualize_predictions(x_test, y_test, pred_test, num_samples=3)
     

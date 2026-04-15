@@ -39,7 +39,7 @@ class Config:
     RANDOM_SEED: int = 42
     
     # Output
-    MODEL_SAVE_PATH: str = "license_plate_detector.h5"
+    MODEL_SAVE_PATH: str = "license_plate_detector.keras"
     VISUALIZATION_PATH: str = "predictions.png"
     
     @classmethod
