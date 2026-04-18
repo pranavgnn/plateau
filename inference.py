@@ -13,6 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from model import LicensePlateDetectionModel
 
 
 def find_best_checkpoint(model_path: Optional[str] = None) -> str:
@@ -62,6 +63,9 @@ def find_best_checkpoint(model_path: Optional[str] = None) -> str:
         "  2. Specify model path: PlateDetector('model_path.pt')\n"
         "  3. Place checkpoint in current directory"
     )
+
+
+class PlateDetector:
     """Inference wrapper for license plate detection with TTA."""
     
     def __init__(self, model_path: Optional[str] = None, device: torch.device | None = None):
