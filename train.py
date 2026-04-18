@@ -1,6 +1,7 @@
 """PyTorch training script for license plate detection with 3-phase training."""
 
-from typing import Tuple
+from typing import Tuple, Optional
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -58,6 +59,15 @@ class PlateDataset(Dataset):
         if self.weights is not None:
             return self.images[idx], self.bboxes[idx], self.weights[idx]
         return self.images[idx], self.bboxes[idx]
+
+
+def find_latest_checkpoint(pattern: str) -> Optional[str]:
+    """Find the most recent checkpoint matching the pattern."""
+    checkpoints = list(Path(".").glob(pattern))
+    if not checkpoints:
+        return None
+    # Return the most recently modified checkpoint
+    return str(max(checkpoints, key=lambda p: p.stat().st_mtime))
 
 
 def train_phase(
@@ -198,35 +208,66 @@ def main() -> None:
     # Loss and optimizer
     criterion = BoxRegressionLoss()
     
-    # ===== PHASE 1: Warmup + Head Training (frozen backbone) =====
-    print("\n" + "="*60)
-    print("PHASE 1: Training Head with Frozen Backbone (Warmup)")
-    print("="*60)
+    # Determine which phase to start from
+    phase3_checkpoint = find_latest_checkpoint("license_plate_detector_phase3_*.pt")
+    phase2_checkpoint = find_latest_checkpoint("license_plate_detector_phase2_*.pt")
+    phase1_checkpoint = find_latest_checkpoint("license_plate_detector_phase1_*.pt")
     
-    detector.freeze_backbone(freeze=True)
-    optimizer = create_optimizer(detector, learning_rate=2e-4)
-    train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=20, phase_name="Phase 1")
-    detector.save(f"license_plate_detector_phase1_{timestamp}.pt")
+    if phase3_checkpoint:
+        print("\n⚠️  Phase 3 checkpoint found. Training already complete!")
+        print(f"Using: {phase3_checkpoint}")
+        detector.load(phase3_checkpoint)
+    elif phase2_checkpoint:
+        print("\n⚠️  Phase 2 checkpoint found. Resuming from Phase 3...")
+        print(f"Loading: {phase2_checkpoint}")
+        detector.load(phase2_checkpoint)
+    elif phase1_checkpoint:
+        print("\n⚠️  Phase 1 checkpoint found. Resuming from Phase 2...")
+        print(f"Loading: {phase1_checkpoint}")
+        detector.load(phase1_checkpoint)
+    else:
+        print("\n✓ No checkpoints found. Starting fresh training...")
+    
+    # ===== PHASE 1: Warmup + Head Training (frozen backbone) =====
+    if not phase1_checkpoint:
+        print("\n" + "="*60)
+        print("PHASE 1: Training Head with Frozen Backbone (Warmup)")
+        print("="*60)
+        
+        detector.freeze_backbone(freeze=True)
+        optimizer = create_optimizer(detector, learning_rate=2e-4)
+        train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=20, phase_name="Phase 1")
+        detector.save(f"license_plate_detector_phase1_{timestamp}.pt")
+        phase1_checkpoint = f"license_plate_detector_phase1_{timestamp}.pt"
+    else:
+        print("\n⊘ Skipping Phase 1 (already completed)")
 
     # ===== PHASE 2: Fine-tune Top Backbone Layers =====
-    print("\n" + "="*60)
-    print("PHASE 2: Fine-tuning Top Backbone Layers")
-    print("="*60)
-    
-    detector.freeze_top_layers(fine_tune_at=200)
-    optimizer = create_optimizer(detector, learning_rate=5e-5)
-    train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=30, phase_name="Phase 2")
-    detector.save(f"license_plate_detector_phase2_{timestamp}.pt")
+    if not phase2_checkpoint:
+        print("\n" + "="*60)
+        print("PHASE 2: Fine-tuning Top Backbone Layers")
+        print("="*60)
+        
+        detector.freeze_top_layers(fine_tune_at=200)
+        optimizer = create_optimizer(detector, learning_rate=5e-5)
+        train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=30, phase_name="Phase 2")
+        detector.save(f"license_plate_detector_phase2_{timestamp}.pt")
+        phase2_checkpoint = f"license_plate_detector_phase2_{timestamp}.pt"
+    else:
+        print("\n⊘ Skipping Phase 2 (already completed)")
 
     # ===== PHASE 3: Full Network Fine-tuning =====
-    print("\n" + "="*60)
-    print("PHASE 3: Full Network Fine-tuning with Lower LR")
-    print("="*60)
-    
-    detector.freeze_top_layers(fine_tune_at=100)
-    optimizer = create_optimizer(detector, learning_rate=1e-5)
-    train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=25, phase_name="Phase 3")
-    detector.save(f"license_plate_detector_phase3_{timestamp}.pt")
+    if not phase3_checkpoint:
+        print("\n" + "="*60)
+        print("PHASE 3: Full Network Fine-tuning with Lower LR")
+        print("="*60)
+        
+        detector.freeze_top_layers(fine_tune_at=100)
+        optimizer = create_optimizer(detector, learning_rate=1e-5)
+        train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=25, phase_name="Phase 3")
+        detector.save(f"license_plate_detector_phase3_{timestamp}.pt")
+    else:
+        print("\n⊘ Skipping Phase 3 (already completed)")
     
     # Evaluate
     print("\n" + "="*60)

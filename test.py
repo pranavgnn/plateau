@@ -1,3 +1,4 @@
 import torch
-x = torch.rand(5, 3)
-print(x)
+import torchvision
+print(torchvision.__version__)
+print(torch.__version__)
