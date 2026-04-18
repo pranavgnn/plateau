@@ -5,23 +5,72 @@ Improvements over v1:
   - Averages predictions across augmented views for robustness
   - Updated to 320×320 input resolution
   - GPU acceleration support
+  - Auto-detects available checkpoints and resumes from best available
 """
 
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from model import LicensePlateDetectionModel
 
 
-class PlateDetector:
+def find_best_checkpoint(model_path: Optional[str] = None) -> str:
+    """Find the best available checkpoint. Priority: Phase 3 > Phase 2 > Phase 1 > final.
+    
+    Args:
+        model_path: Explicit model path. If provided, use it directly.
+        
+    Returns:
+        Path to the checkpoint to load.
+        
+    Raises:
+        FileNotFoundError: If no checkpoint is found.
+    """
+    if model_path and Path(model_path).exists():
+        print(f"✓ Using specified model: {model_path}")
+        return model_path
+    
+    # Search for checkpoints in priority order
+    phase3_checkpoint = list(Path(".").glob("license_plate_detector_phase3_*.pt"))
+    phase2_checkpoint = list(Path(".").glob("license_plate_detector_phase2_*.pt"))
+    phase1_checkpoint = list(Path(".").glob("license_plate_detector_phase1_*.pt"))
+    final_checkpoint = Path("license_plate_detector.pt")
+    
+    if phase3_checkpoint:
+        checkpoint = str(max(phase3_checkpoint, key=lambda p: p.stat().st_mtime))
+        print(f"✓ Found Phase 3 checkpoint: {checkpoint}")
+        return checkpoint
+    
+    if phase2_checkpoint:
+        checkpoint = str(max(phase2_checkpoint, key=lambda p: p.stat().st_mtime))
+        print(f"✓ Found Phase 2 checkpoint: {checkpoint} (Phase 3 not yet trained)")
+        return checkpoint
+    
+    if phase1_checkpoint:
+        checkpoint = str(max(phase1_checkpoint, key=lambda p: p.stat().st_mtime))
+        print(f"✓ Found Phase 1 checkpoint: {checkpoint} (Phase 2-3 not yet trained)")
+        return checkpoint
+    
+    if final_checkpoint.exists():
+        print(f"✓ Using final model: {final_checkpoint}")
+        return str(final_checkpoint)
+    
+    raise FileNotFoundError(
+        "No checkpoint found! Available options:\n"
+        "  1. Run training first: python train.py\n"
+        "  2. Specify model path: PlateDetector('model_path.pt')\n"
+        "  3. Place checkpoint in current directory"
+    )
     """Inference wrapper for license plate detection with TTA."""
     
-    def __init__(self, model_path: str, device: torch.device | None = None):
+    def __init__(self, model_path: Optional[str] = None, device: torch.device | None = None):
+        # Auto-detect best checkpoint if not specified
+        resolved_path = find_best_checkpoint(model_path)
+        
         self.device = device or (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.detector = LicensePlateDetectionModel(device=self.device)
-        self.detector.load(model_path)
+        self.detector.load(resolved_path)
         self.detector.eval()
         self._tta_scales = [0.85, 1.0, 1.15]
         self._use_tta = True
