@@ -33,14 +33,13 @@ def find_best_checkpoint(model_path: Optional[str] = None) -> str:
         return model_path
     
     def is_valid_checkpoint(filepath: str) -> bool:
-        """Test if checkpoint file is valid without fully loading it."""
+        """Test if checkpoint file is valid by attempting to load it."""
         try:
-            # Try to read the checkpoint header
-            with open(filepath, 'rb') as f:
-                header = f.read(4)
-                # PyTorch checkpoint files start with PK (zip format)
-                return header == b'PK\x03\x04'
-        except:
+            # Try to actually load the checkpoint
+            torch.load(filepath, map_location='cpu')
+            return True
+        except Exception as e:
+            print(f"  Invalid checkpoint: {str(e)[:60]}...")
             return False
     
     # Search for checkpoints in priority order
@@ -53,24 +52,26 @@ def find_best_checkpoint(model_path: Optional[str] = None) -> str:
     
     for phase_name, checkpoints in all_checkpoints:
         if checkpoints:
-            # Get most recent checkpoint
-            checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime if p.exists() else 0)
-            checkpoint_str = str(checkpoint)
+            # Sort by modification time, newest first
+            sorted_checkpoints = sorted([c for c in checkpoints if c.exists()], 
+                                       key=lambda p: p.stat().st_mtime, 
+                                       reverse=True)
             
-            # Validate it's not corrupted
-            if is_valid_checkpoint(checkpoint_str):
-                print(f"✓ Found {phase_name} checkpoint: {checkpoint_str}")
-                return checkpoint_str
-            else:
-                print(f"⚠ Skipping corrupted {phase_name} checkpoint: {checkpoint_str}")
+            for checkpoint in sorted_checkpoints:
+                checkpoint_str = str(checkpoint)
+                print(f"Checking {phase_name} checkpoint: {checkpoint_str}...", end=" ")
+                
+                if is_valid_checkpoint(checkpoint_str):
+                    print(f"✓ Valid!")
+                    return checkpoint_str
+                else:
+                    print(f"⚠ Corrupted, skipping...")
     
     raise FileNotFoundError(
-        "No valid checkpoint found! Available options:\n"
-        "  1. Run training first: python train.py\n"
-        "  2. Specify model path: PlateDetector('model_path.pt')\n"
-        "  3. Check that checkpoint files are not corrupted\n"
-        "\nNote: Checkpoints are only saved at the END of each phase. "
-        "If training was interrupted mid-phase, no checkpoint exists for that phase."
+        "No valid checkpoint found! All checkpoint files are corrupted or incomplete.\n"
+        "\nTo fix this, run training again:\n"
+        "  python train.py\n"
+        "\nThe checkpoint resuming feature will skip completed phases and continue from where it left off."
     )
 
 
