@@ -15,7 +15,7 @@ def example_load_dataset() -> None:
     dataset = LicensePlateDataset(dataset_id="saisirishan/indian-vehicle-dataset")
     dataset.download()
     
-    samples = dataset.load(img_shape=(224, 224))
+    samples = dataset.load(img_shape=(320, 320))
     print(f"Loaded {len(samples)} samples")
     
     if samples:
@@ -28,7 +28,7 @@ def example_build_model() -> None:
     """Example: Build and inspect model."""
     print("\n=== Example 2: Build Model ===\n")
     
-    detector = LicensePlateDetectionModel(input_shape=(224, 224, 3))
+    detector = LicensePlateDetectionModel(input_shape=(320, 320, 3))
     model = detector.build()
     print("Model architecture:")
     detector.get_summary()
@@ -41,7 +41,7 @@ def example_quick_train() -> None:
     # Load dataset
     dataset = LicensePlateDataset()
     dataset.download()
-    samples = dataset.load(img_shape=(224, 224))
+    samples = dataset.load(img_shape=(320, 320))
     
     if len(samples) < 100:
         print("Dataset too small for training")

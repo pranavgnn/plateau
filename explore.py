@@ -14,7 +14,7 @@ def explore_dataset() -> None:
     # Load dataset
     dataset = LicensePlateDataset()
     dataset.download()
-    dataset.load(img_shape=(224, 224))
+    dataset.load(img_shape=(320, 320))
     
     images, bboxes, plate_texts = dataset.get_arrays()
     
@@ -59,7 +59,7 @@ def visualize_dataset_samples(num_samples: int = 9) -> None:
     
     dataset = LicensePlateDataset()
     dataset.download()
-    samples = dataset.load(img_shape=(224, 224))
+    samples = dataset.load(img_shape=(320, 320))
     
     fig, axes = plt.subplots(3, 3, figsize=(12, 12))
     axes = axes.flatten()

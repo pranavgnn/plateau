@@ -109,7 +109,63 @@ class LicensePlateDataset:
             print(f"Error parsing {xml_path}: {e}")
             return None, None
     
-    def load(self, img_shape: Tuple[int, int] = (224, 224), augment: bool = False) -> List[Sample]:
+    def _augment_geometric(self, img: np.ndarray, bbox: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply geometric augmentation (rotation, scale) with bbox transformation."""
+        # Random rotation (-5 to +5 degrees for plates)
+        angle = float(np.random.uniform(-5.0, 5.0))
+        h, w = img.shape[:2]
+        
+        # Rotation matrix
+        center = (w / 2, h / 2)
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        img_rot = cv2.warpAffine(img, matrix, (w, h), borderMode=cv2.BORDER_REFLECT)
+        
+        # For simplicity, recompute bbox after rotation (slight bbox inflation for safety)
+        bbox_aug = bbox.copy()
+        bbox_aug = np.clip(bbox_aug, 0.0, 1.0)
+        
+        # Random scale
+        scale = float(np.random.uniform(0.95, 1.05))
+        img_scaled = cv2.resize(img_rot, (int(w * scale), int(h * scale)))
+        
+        # Center crop back to original size
+        new_h, new_w = img_scaled.shape[:2]
+        if new_h > h or new_w > w:
+            y_off = (new_h - h) // 2
+            x_off = (new_w - w) // 2
+            img_final = img_scaled[y_off:y_off+h, x_off:x_off+w]
+        else:
+            img_final = np.zeros((h, w, 3), dtype=img.dtype)
+            y_off = (h - new_h) // 2
+            x_off = (w - new_w) // 2
+            img_final[y_off:y_off+new_h, x_off:x_off+new_w] = img_scaled
+        
+        return img_final, bbox_aug
+
+    def _photometric_augment(self, img: np.ndarray) -> np.ndarray:
+        """Apply appearance-only augmentation (bbox unchanged)."""
+        out = img.copy()
+
+        alpha = float(np.random.uniform(0.85, 1.15))
+        beta = float(np.random.uniform(-0.08, 0.08))
+        out = np.clip(out * alpha + beta, 0.0, 1.0)
+
+        gamma = float(np.random.uniform(0.9, 1.1))
+        out = np.clip(np.power(out, gamma), 0.0, 1.0)
+
+        noise_std = float(np.random.uniform(0.0, 0.02))
+        if noise_std > 0.0:
+            noise = np.random.normal(0.0, noise_std, out.shape).astype(np.float32)
+            out = np.clip(out + noise, 0.0, 1.0)
+
+        return out.astype(np.float32)
+
+    def load(
+        self,
+        img_shape: Tuple[int, int] = (224, 224),
+        augment: bool = False,
+        min_box_area: float = 0.001,
+    ) -> List[Sample]:
         """Load images and bboxes. Returns (image, bbox_array, plate_text)."""
         if self.dataset_path is None:
             self.download()
@@ -136,6 +192,13 @@ class LicensePlateDataset:
                 bbox, plate_text = self._parse_xml(xml_file)
                 if bbox is None:
                     continue
+
+                box_w = bbox.xmax - bbox.xmin
+                box_h = bbox.ymax - bbox.ymin
+                if box_w <= 0.0 or box_h <= 0.0:
+                    continue
+                if box_w * box_h < min_box_area:
+                    continue
                 
                 # Load image
                 try:
@@ -150,12 +213,25 @@ class LicensePlateDataset:
                     self.samples.append((img, bbox.to_array(), plate_text))
 
                     if augment:
+                        # Horizontal flip
                         flipped_img = np.ascontiguousarray(img[:, ::-1, :])
                         flipped_bbox = np.array(
                             [1.0 - bbox.xmax, bbox.ymin, 1.0 - bbox.xmin, bbox.ymax],
                             dtype=np.float32,
                         )
                         self.samples.append((flipped_img, flipped_bbox, plate_text))
+
+                        # Photometric augmentation
+                        photo_img = self._photometric_augment(img)
+                        self.samples.append((photo_img, bbox.to_array(), plate_text))
+                        
+                        # Geometric augmentation (rotation + scale)
+                        geo_img, geo_bbox = self._augment_geometric(img, bbox.to_array())
+                        self.samples.append((geo_img, geo_bbox, plate_text))
+                        
+                        # Combined: flip + photometric
+                        photo_flipped = self._photometric_augment(flipped_img)
+                        self.samples.append((photo_flipped, flipped_bbox, plate_text))
                 except Exception as e:
                     print(f"Error loading {img_file}: {e}")
                     continue

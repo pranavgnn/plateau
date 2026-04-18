@@ -1,12 +1,41 @@
-"""Type-safe training script for license plate detection."""
+"""Type-safe training script for license plate detection with 3-phase training."""
 
 from typing import Tuple
 import numpy as np
 from tensorflow import keras
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+from datetime import datetime
 from dataset_loader import LicensePlateDataset
-from model import LicensePlateDetectionModel, BoxRegressionLoss, BoundingBoxMetric
+from model import (
+    LicensePlateDetectionModel,
+    BoxRegressionLoss,
+    BoundingBoxMetric,
+    create_optimizer,
+)
+
+
+def compute_area_weights(bboxes: np.ndarray) -> np.ndarray:
+    """Upweight small plates so localization does not overfit to larger boxes."""
+    widths = np.maximum(1e-6, bboxes[:, 2] - bboxes[:, 0])
+    heights = np.maximum(1e-6, bboxes[:, 3] - bboxes[:, 1])
+    areas = widths * heights
+    median_area = float(np.median(areas))
+    weights = np.sqrt(median_area / areas)
+    return np.clip(weights, 0.5, 2.5).astype(np.float32)
+
+
+def make_area_bins(bboxes: np.ndarray, num_bins: int = 5) -> np.ndarray:
+    """Create quantile bins from bbox area for approximate stratification."""
+    widths = np.maximum(1e-6, bboxes[:, 2] - bboxes[:, 0])
+    heights = np.maximum(1e-6, bboxes[:, 3] - bboxes[:, 1])
+    areas = widths * heights
+    quantiles = np.linspace(0.0, 1.0, num_bins + 1)
+    edges = np.quantile(areas, quantiles)
+    edges = np.unique(edges)
+    if len(edges) <= 2:
+        return np.zeros(len(areas), dtype=np.int32)
+    return np.digitize(areas, edges[1:-1], right=False).astype(np.int32)
 
 
 def visualize_predictions(
@@ -58,83 +87,217 @@ def visualize_predictions(
 
 
 def main() -> None:
-    """Main training pipeline."""
+    """Main training pipeline with 3-phase strategy."""
     
-    print("=== License Plate Detection Training ===\n")
+    print("=== License Plate Detection - Enhanced Training (FPN + CBAM + CIoU) ===\n")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Load dataset
     print("1. Loading dataset...")
     dataset = LicensePlateDataset(dataset_id="saisirishan/indian-vehicle-dataset")
-    dataset.load(img_shape=(224, 224), augment=True)
+    dataset.load(img_shape=(320, 320), augment=True)
     
     images, bboxes, plate_texts = dataset.get_arrays()
     print(f"Images: {images.shape}, Bboxes: {bboxes.shape}")
     
-    # Split data
+    # Split data with stratification by box size
     print("\n2. Splitting dataset...")
+    area_bins = make_area_bins(bboxes)
     x_train, x_temp, y_train, y_temp = train_test_split(
-        images, bboxes, test_size=0.3, random_state=42
+        images,
+        bboxes,
+        test_size=0.3,
+        random_state=42,
+        stratify=area_bins,
     )
+    temp_bins = make_area_bins(y_temp)
     x_val, x_test, y_val, y_test = train_test_split(
-        x_temp, y_temp, test_size=0.5, random_state=42
+        x_temp,
+        y_temp,
+        test_size=0.5,
+        random_state=42,
+        stratify=temp_bins,
     )
     print(f"Train: {x_train.shape}, Val: {x_val.shape}, Test: {x_test.shape}")
+
+    train_weights = compute_area_weights(y_train)
     
     # Build model
-    print("\n3. Building model...")
-    detector = LicensePlateDetectionModel(input_shape=(224, 224, 3))
+    print("\n3. Building model with FPN + CBAM...")
+    detector = LicensePlateDetectionModel(input_shape=(320, 320, 3))
     detector.build()
     detector.get_summary()
     
-    # Phase 1: train head while backbone frozen
-    print("\n4. Compiling model...")
+    # ===== PHASE 1: Warmup + Head Training (frozen backbone) =====
+    print("\n" + "="*60)
+    print("PHASE 1: Training Head with Frozen Backbone (Warmup)")
+    print("="*60)
+    
     detector.set_backbone_trainable(False)
     detector.compile(
-        optimizer=None,
+        optimizer=create_optimizer(learning_rate=2e-4),
         loss=BoxRegressionLoss(),
         metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
     )
+
+    phase1_callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_mean_ciou",
+            mode="max",
+            patience=8,
+            restore_best_weights=True,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_mean_ciou",
+            mode="max",
+            factor=0.5,
+            patience=2,
+            min_lr=1e-6,
+            verbose=1,
+        ),
+        keras.callbacks.ModelCheckpoint(
+            f"license_plate_detector_phase1_{timestamp}.keras",
+            monitor="val_mean_ciou",
+            mode="max",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
     
-    print("\n5. Training head..." )
+    print("\nPhase 1: Training head (20 epochs with aggressive augmentation)...")
     detector.train(
         x_train, y_train,
         x_val=x_val, y_val=y_val,
-        epochs=15,
-        batch_size=16
+        sample_weight=train_weights,
+        epochs=20,
+        batch_size=16,
+        callbacks=phase1_callbacks,
     )
 
-    # Phase 2: fine-tune top backbone layers with lower LR
-    print("\n6. Fine-tuning backbone...")
-    detector.set_backbone_trainable(True, fine_tune_at=180)
+    # ===== PHASE 2: Fine-tune Top Backbone Layers =====
+    print("\n" + "="*60)
+    print("PHASE 2: Fine-tuning Top Backbone Layers")
+    print("="*60)
+    
+    detector.set_backbone_trainable(True, fine_tune_at=200)
     detector.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+        optimizer=create_optimizer(learning_rate=5e-5),
         loss=BoxRegressionLoss(),
         metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
     )
+
+    phase2_callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_mean_ciou",
+            mode="max",
+            patience=10,
+            restore_best_weights=True,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_mean_ciou",
+            mode="max",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=1,
+        ),
+        keras.callbacks.ModelCheckpoint(
+            f"license_plate_detector_phase2_{timestamp}.keras",
+            monitor="val_mean_ciou",
+            mode="max",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
+
+    print("\nPhase 2: Fine-tuning backbone (30 epochs)...")
     detector.train(
         x_train,
         y_train,
         x_val=x_val,
         y_val=y_val,
-        epochs=20,
+        sample_weight=train_weights,
+        epochs=30,
         batch_size=16,
+        callbacks=phase2_callbacks,
+    )
+
+    # ===== PHASE 3: Full Network Fine-tuning =====
+    print("\n" + "="*60)
+    print("PHASE 3: Full Network Fine-tuning with Lower LR")
+    print("="*60)
+    
+    detector.set_backbone_trainable(True, fine_tune_at=100)
+    detector.compile(
+        optimizer=create_optimizer(learning_rate=1e-5),
+        loss=BoxRegressionLoss(),
+        metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
+    )
+
+    phase3_callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_mean_ciou",
+            mode="max",
+            patience=12,
+            restore_best_weights=True,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_mean_ciou",
+            mode="max",
+            factor=0.5,
+            patience=4,
+            min_lr=5e-7,
+            verbose=1,
+        ),
+        keras.callbacks.ModelCheckpoint(
+            f"license_plate_detector_phase3_{timestamp}.keras",
+            monitor="val_mean_ciou",
+            mode="max",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
+
+    print("\nPhase 3: Full network fine-tuning (25 epochs)...")
+    detector.train(
+        x_train,
+        y_train,
+        x_val=x_val,
+        y_val=y_val,
+        sample_weight=train_weights,
+        epochs=25,
+        batch_size=16,
+        callbacks=phase3_callbacks,
     )
     
     # Evaluate
-    print("\n7. Evaluating on test set...")
-    test_loss, test_iou, test_mae = detector.model.evaluate(x_test, y_test, verbose=0)
-    print(f"Test Loss: {test_loss:.4f}, Test IoU: {test_iou:.4f}, Test MAE: {test_mae:.4f}")
+    print("\n" + "="*60)
+    print("EVALUATION")
+    print("="*60)
+    test_loss, test_ciou, test_mae = detector.model.evaluate(x_test, y_test, verbose=0)
+    print(f"\nTest Loss: {test_loss:.4f}")
+    print(f"Test CIoU: {test_ciou:.4f}")
+    print(f"Test MAE: {test_mae:.4f}")
     
-    # Save model
-    print("\n8. Saving model...")
+    # Save final model
+    print("\n7. Saving final model...")
     detector.save('license_plate_detector.keras')
     
     # Visualize predictions
-    print("\n9. Visualizing predictions...")
+    print("\n8. Visualizing predictions...")
     pred_test = detector.predict(x_test)
-    visualize_predictions(x_test, y_test, pred_test, num_samples=3)
+    visualize_predictions(x_test, y_test, pred_test, num_samples=5)
     
-    print("\n=== Training Complete ===")
+    print("\n" + "="*60)
+    print("=== Training Complete ===")
+    print("="*60)
+    print(f"Model saved as: license_plate_detector.keras")
+    print(f"Checkpoint models: license_plate_detector_phase*.keras")
+    print("\nRun inference with:")
+    print("  from inference import PlateDetector")
+    print("  detector = PlateDetector('license_plate_detector.keras')")
+    print("  detector.detect_and_draw('image.jpg', 'output.jpg')")
+
 
 
 if __name__ == "__main__":
