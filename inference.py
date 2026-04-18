@@ -26,42 +26,51 @@ def find_best_checkpoint(model_path: Optional[str] = None) -> str:
         Path to the checkpoint to load.
         
     Raises:
-        FileNotFoundError: If no checkpoint is found.
+        FileNotFoundError: If no valid checkpoint is found.
     """
     if model_path and Path(model_path).exists():
         print(f"✓ Using specified model: {model_path}")
         return model_path
     
+    def is_valid_checkpoint(filepath: str) -> bool:
+        """Test if checkpoint file is valid without fully loading it."""
+        try:
+            # Try to read the checkpoint header
+            with open(filepath, 'rb') as f:
+                header = f.read(4)
+                # PyTorch checkpoint files start with PK (zip format)
+                return header == b'PK\x03\x04'
+        except:
+            return False
+    
     # Search for checkpoints in priority order
-    phase3_checkpoint = list(Path(".").glob("license_plate_detector_phase3_*.pt"))
-    phase2_checkpoint = list(Path(".").glob("license_plate_detector_phase2_*.pt"))
-    phase1_checkpoint = list(Path(".").glob("license_plate_detector_phase1_*.pt"))
-    final_checkpoint = Path("license_plate_detector.pt")
+    all_checkpoints = [
+        ("Phase 3", list(Path(".").glob("license_plate_detector_phase3_*.pt"))),
+        ("Phase 2", list(Path(".").glob("license_plate_detector_phase2_*.pt"))),
+        ("Phase 1", list(Path(".").glob("license_plate_detector_phase1_*.pt"))),
+        ("Final", [Path("license_plate_detector.pt")] if Path("license_plate_detector.pt").exists() else []),
+    ]
     
-    if phase3_checkpoint:
-        checkpoint = str(max(phase3_checkpoint, key=lambda p: p.stat().st_mtime))
-        print(f"✓ Found Phase 3 checkpoint: {checkpoint}")
-        return checkpoint
-    
-    if phase2_checkpoint:
-        checkpoint = str(max(phase2_checkpoint, key=lambda p: p.stat().st_mtime))
-        print(f"✓ Found Phase 2 checkpoint: {checkpoint} (Phase 3 not yet trained)")
-        return checkpoint
-    
-    if phase1_checkpoint:
-        checkpoint = str(max(phase1_checkpoint, key=lambda p: p.stat().st_mtime))
-        print(f"✓ Found Phase 1 checkpoint: {checkpoint} (Phase 2-3 not yet trained)")
-        return checkpoint
-    
-    if final_checkpoint.exists():
-        print(f"✓ Using final model: {final_checkpoint}")
-        return str(final_checkpoint)
+    for phase_name, checkpoints in all_checkpoints:
+        if checkpoints:
+            # Get most recent checkpoint
+            checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime if p.exists() else 0)
+            checkpoint_str = str(checkpoint)
+            
+            # Validate it's not corrupted
+            if is_valid_checkpoint(checkpoint_str):
+                print(f"✓ Found {phase_name} checkpoint: {checkpoint_str}")
+                return checkpoint_str
+            else:
+                print(f"⚠ Skipping corrupted {phase_name} checkpoint: {checkpoint_str}")
     
     raise FileNotFoundError(
-        "No checkpoint found! Available options:\n"
+        "No valid checkpoint found! Available options:\n"
         "  1. Run training first: python train.py\n"
         "  2. Specify model path: PlateDetector('model_path.pt')\n"
-        "  3. Place checkpoint in current directory"
+        "  3. Check that checkpoint files are not corrupted\n"
+        "\nNote: Checkpoints are only saved at the END of each phase. "
+        "If training was interrupted mid-phase, no checkpoint exists for that phase."
     )
 
 
