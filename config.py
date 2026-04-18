@@ -1,4 +1,4 @@
-"""Configuration for plateau license plate detection model."""
+"""Configuration for plateau license plate detection model (PyTorch)."""
 
 from typing import Dict, Any
 
@@ -11,11 +11,11 @@ class Config:
     IMG_SHAPE: tuple = (320, 320)
     
     # Model
-    BACKBONE: str = "EfficientNetV2B2"  # upgraded from MobileNetV2
+    BACKBONE: str = "EfficientNetV2B2"  # PyTorch torchvision
     FREEZE_BACKBONE: bool = True
     INPUT_SHAPE: tuple = (320, 320, 3)
     
-    # Architecture (FPN + CBAM + ANN head)
+    # Architecture (FPN + CBAM + Dense head)
     FPN_CHANNELS: int = 256
     DENSE_LAYERS: list = [512, 256, 128, 64]
     DROPOUT_RATES: list = [0.35, 0.25, 0.15, 0.1]
@@ -29,7 +29,7 @@ class Config:
     PHASE1_LR: float = 2e-4
     PHASE2_LR: float = 5e-5
     PHASE3_LR: float = 1e-5
-    LOSS_FN: str = "ciou"  # upgraded from mse/iou
+    LOSS_FN: str = "ciou"  # Complete IoU loss
     OPTIMIZER: str = "adamw"
     WARMUP_EPOCHS: int = 3
     
@@ -48,6 +48,10 @@ class Config:
     # Augmentation
     AUGMENT: bool = True
     MAX_ROTATION_ANGLE: float = 5.0
+    
+    # Device
+    DEVICE: str = "cuda"  # cuda or cpu
+    USE_AMP: bool = True  # Automatic Mixed Precision for faster training
     SCALE_RANGE: tuple = (0.85, 1.15)
     CUTOUT_PATCHES: int = 2
     

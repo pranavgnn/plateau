@@ -1,37 +1,43 @@
-"""Type-safe inference script for license plate detection.
+"""PyTorch inference script for license plate detection.
 
 Improvements over v1:
   - Test-Time Augmentation (TTA): multi-scale + horizontal flip
   - Averages predictions across augmented views for robustness
   - Updated to 320×320 input resolution
+  - GPU acceleration support
 """
 
 from typing import Tuple, List
 from pathlib import Path
 import cv2
 import numpy as np
+import torch
 from model import LicensePlateDetectionModel
 
 
 class PlateDetector:
     """Inference wrapper for license plate detection with TTA."""
     
-    def __init__(self, model_path: str):
-        self.detector = LicensePlateDetectionModel()
+    def __init__(self, model_path: str, device: torch.device | None = None):
+        self.device = device or (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.detector = LicensePlateDetectionModel(device=self.device)
         self.detector.load(model_path)
+        self.detector.eval()
         self._tta_scales = [0.85, 1.0, 1.15]
         self._use_tta = True
     
-    def _preprocess(self, img_bgr: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+    def _preprocess(self, img_bgr: np.ndarray, target_size: Tuple[int, int]) -> torch.Tensor:
         """BGR image → normalized RGB tensor [1, H, W, 3]."""
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, target_size)
         img = img.astype(np.float32) / 255.0
-        return np.expand_dims(img, axis=0)
+        return torch.tensor(np.expand_dims(img, axis=0), dtype=torch.float32).to(self.device)
 
-    def _predict_single(self, img_batch: np.ndarray) -> np.ndarray:
+    def _predict_single(self, img_batch: torch.Tensor) -> np.ndarray:
         """Run model on a single [1, H, W, 3] batch and return [4] bbox."""
-        return self.detector.predict(img_batch)[0]
+        with torch.no_grad():
+            output = self.detector(img_batch)
+        return output[0].cpu().numpy()
 
     def _predict_with_tta(
         self,
@@ -48,7 +54,7 @@ class PlateDetector:
             # Center crop / pad to target_size
             img_final = self._center_crop_or_pad(img_scaled, target_size)
             img_norm = img_final.astype(np.float32) / 255.0
-            batch = np.expand_dims(img_norm, axis=0)
+            batch = torch.tensor(np.expand_dims(img_norm, axis=0), dtype=torch.float32).to(self.device)
 
             # Original orientation
             pred = self._predict_single(batch)
@@ -57,7 +63,8 @@ class PlateDetector:
             all_preds.append(pred_adjusted)
 
             # Horizontal flip
-            flipped = np.ascontiguousarray(batch[:, :, ::-1, :])
+            flipped = np.ascontiguousarray(batch.cpu().numpy()[:, :, ::-1, :])
+            flipped = torch.tensor(flipped, dtype=torch.float32).to(self.device)
             pred_flip = self._predict_single(flipped)
             # Un-flip x coordinates
             pred_unflip = np.array([
@@ -72,6 +79,7 @@ class PlateDetector:
         # Average all predictions
         avg_pred = np.mean(all_preds, axis=0)
         return np.clip(avg_pred, 0.0, 1.0)
+
 
     @staticmethod
     def _center_crop_or_pad(img: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
@@ -190,8 +198,6 @@ class PlateDetector:
         img, bbox = self.detect(image_path)
         img_with_bbox = self.draw_bbox(img, bbox)
         
-        # Convert RGB back to BGR for OpenCV
-        img_with_bbox = cv2.cvtColor(img_with_bbox, cv2.COLOR_RGB2BGR)
         cv2.imwrite(output_path, img_with_bbox)
         
         print(f"Saved result to {output_path}")
@@ -229,9 +235,9 @@ def batch_detect(
 # Example usage
 if __name__ == "__main__":
     # Initialize detector
-    model_path = Path("license_plate_detector.keras")
+    model_path = Path("license_plate_detector.pt")
     if not model_path.exists():
-        model_path = Path("license_plate_detector.h5")
+        model_path = Path("license_plate_detector.keras")
 
     detector = PlateDetector(str(model_path))
     

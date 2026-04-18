@@ -1,64 +1,66 @@
-"""Type-safe model for license plate detection with FPN + CBAM + CIoU."""
+"""PyTorch model for license plate detection with FPN + CBAM + CIoU."""
 
 from __future__ import annotations
 
 from typing import Optional, Tuple
-
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
 
 
-def box_iou(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+def box_iou(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """Compute IoU for normalized corner-format boxes."""
-    inter_xmin = tf.maximum(y_true[:, 0], y_pred[:, 0])
-    inter_ymin = tf.maximum(y_true[:, 1], y_pred[:, 1])
-    inter_xmax = tf.minimum(y_true[:, 2], y_pred[:, 2])
-    inter_ymax = tf.minimum(y_true[:, 3], y_pred[:, 3])
+    inter_xmin = torch.max(y_true[:, 0], y_pred[:, 0])
+    inter_ymin = torch.max(y_true[:, 1], y_pred[:, 1])
+    inter_xmax = torch.min(y_true[:, 2], y_pred[:, 2])
+    inter_ymax = torch.min(y_true[:, 3], y_pred[:, 3])
 
-    inter_w = tf.maximum(0.0, inter_xmax - inter_xmin)
-    inter_h = tf.maximum(0.0, inter_ymax - inter_ymin)
+    inter_w = torch.clamp(inter_xmax - inter_xmin, min=0.0)
+    inter_h = torch.clamp(inter_ymax - inter_ymin, min=0.0)
     intersection = inter_w * inter_h
 
-    true_w = tf.maximum(0.0, y_true[:, 2] - y_true[:, 0])
-    true_h = tf.maximum(0.0, y_true[:, 3] - y_true[:, 1])
-    pred_w = tf.maximum(0.0, y_pred[:, 2] - y_pred[:, 0])
-    pred_h = tf.maximum(0.0, y_pred[:, 3] - y_pred[:, 1])
-
-    union = true_w * true_h + pred_w * pred_h - intersection
-    return tf.math.divide_no_nan(intersection, union + 1e-6)
-
-
-def box_ciou(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """Compute Complete IoU (CIoU) - better for bbox regression than IoU/GIoU."""
-    # IoU
-    inter_xmin = tf.maximum(y_true[:, 0], y_pred[:, 0])
-    inter_ymin = tf.maximum(y_true[:, 1], y_pred[:, 1])
-    inter_xmax = tf.minimum(y_true[:, 2], y_pred[:, 2])
-    inter_ymax = tf.minimum(y_true[:, 3], y_pred[:, 3])
-
-    inter_w = tf.maximum(0.0, inter_xmax - inter_xmin)
-    inter_h = tf.maximum(0.0, inter_ymax - inter_ymin)
-    intersection = inter_w * inter_h
-
-    true_w = tf.maximum(1e-6, y_true[:, 2] - y_true[:, 0])
-    true_h = tf.maximum(1e-6, y_true[:, 3] - y_true[:, 1])
-    pred_w = tf.maximum(1e-6, y_pred[:, 2] - y_pred[:, 0])
-    pred_h = tf.maximum(1e-6, y_pred[:, 3] - y_pred[:, 1])
+    true_w = torch.clamp(y_true[:, 2] - y_true[:, 0], min=0.0)
+    true_h = torch.clamp(y_true[:, 3] - y_true[:, 1], min=0.0)
+    pred_w = torch.clamp(y_pred[:, 2] - y_pred[:, 0], min=0.0)
+    pred_h = torch.clamp(y_pred[:, 3] - y_pred[:, 1], min=0.0)
 
     true_area = true_w * true_h
     pred_area = pred_w * pred_h
     union = true_area + pred_area - intersection
-    iou = tf.math.divide_no_nan(intersection, union + 1e-6)
+    return torch.divide(intersection, union + 1e-6)
+
+
+def box_ciou(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    """Compute Complete IoU (CIoU) - better for bbox regression than IoU/GIoU."""
+    # IoU
+    inter_xmin = torch.max(y_true[:, 0], y_pred[:, 0])
+    inter_ymin = torch.max(y_true[:, 1], y_pred[:, 1])
+    inter_xmax = torch.min(y_true[:, 2], y_pred[:, 2])
+    inter_ymax = torch.min(y_true[:, 3], y_pred[:, 3])
+
+    inter_w = torch.clamp(inter_xmax - inter_xmin, min=0.0)
+    inter_h = torch.clamp(inter_ymax - inter_ymin, min=0.0)
+    intersection = inter_w * inter_h
+
+    true_w = torch.clamp(y_true[:, 2] - y_true[:, 0], min=1e-6)
+    true_h = torch.clamp(y_true[:, 3] - y_true[:, 1], min=1e-6)
+    pred_w = torch.clamp(y_pred[:, 2] - y_pred[:, 0], min=1e-6)
+    pred_h = torch.clamp(y_pred[:, 3] - y_pred[:, 1], min=1e-6)
+
+    true_area = true_w * true_h
+    pred_area = pred_w * pred_h
+    union = true_area + pred_area - intersection
+    iou = torch.divide(intersection, union + 1e-6)
 
     # Enclosing box
-    enc_xmin = tf.minimum(y_true[:, 0], y_pred[:, 0])
-    enc_ymin = tf.minimum(y_true[:, 1], y_pred[:, 1])
-    enc_xmax = tf.maximum(y_true[:, 2], y_pred[:, 2])
-    enc_ymax = tf.maximum(y_true[:, 3], y_pred[:, 3])
-    enc_w = tf.maximum(0.0, enc_xmax - enc_xmin)
-    enc_h = tf.maximum(0.0, enc_ymax - enc_ymin)
+    enc_xmin = torch.min(y_true[:, 0], y_pred[:, 0])
+    enc_ymin = torch.min(y_true[:, 1], y_pred[:, 1])
+    enc_xmax = torch.max(y_true[:, 2], y_pred[:, 2])
+    enc_ymax = torch.max(y_true[:, 3], y_pred[:, 3])
+    enc_w = torch.clamp(enc_xmax - enc_xmin, min=0.0)
+    enc_h = torch.clamp(enc_ymax - enc_ymin, min=0.0)
     enc_diag = enc_w ** 2 + enc_h ** 2
 
     # Center distance
@@ -70,294 +72,198 @@ def box_ciou(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
 
     # Aspect ratio
     v = (4.0 / (np.pi ** 2)) * (
-        tf.atan(true_w / tf.maximum(1e-6, true_h)) - 
-        tf.atan(pred_w / tf.maximum(1e-6, pred_h))
+        torch.atan(true_w / torch.clamp(true_h, min=1e-6)) - 
+        torch.atan(pred_w / torch.clamp(pred_h, min=1e-6))
     ) ** 2
-    alpha = tf.math.divide_no_nan(v, (1.0 - iou + v) + 1e-6)
+    alpha = torch.divide(v, (1.0 - iou + v) + 1e-6)
 
     ciou = iou - (center_dist / (enc_diag + 1e-6)) - alpha * v
-    return tf.clip_by_value(ciou, -1.0, 1.0)
+    return torch.clamp(ciou, min=-1.0, max=1.0)
 
 
-class ChannelAttention(layers.Layer):
+class ChannelAttention(nn.Module):
     """CBAM Channel Attention Module."""
     
-    def __init__(self, reduction: int = 16, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self.reduction = reduction
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
     
-    def build(self, input_shape: Tuple[int, ...]) -> None:
-        channels = input_shape[-1]
-        self.avg_pool = layers.GlobalAveragePooling2D(keepdims=True)
-        self.max_pool = layers.GlobalMaxPooling2D(keepdims=True)
-        self.dense1 = layers.Dense(channels // self.reduction, activation="relu")
-        self.dense2 = layers.Dense(channels)
-    
-    def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        avg = self.avg_pool(inputs)
-        max_pool = self.max_pool(inputs)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, _, _ = x.size()
         
-        avg = self.dense1(avg)
-        avg = self.dense2(avg)
+        avg_out = self.avg_pool(x).view(batch, channels)
+        avg_out = self.fc(avg_out).view(batch, channels, 1, 1)
         
-        max_pool = self.dense1(max_pool)
-        max_pool = self.dense2(max_pool)
+        max_out = self.max_pool(x).view(batch, channels)
+        max_out = self.fc(max_out).view(batch, channels, 1, 1)
         
-        channel_out = tf.nn.sigmoid(avg + max_pool)
-        return inputs * channel_out
+        out = self.sigmoid(avg_out + max_out)
+        return x * out
 
 
-class SpatialAttention(layers.Layer):
+class SpatialAttention(nn.Module):
     """CBAM Spatial Attention Module."""
     
-    def __init__(self, kernel_size: int = 7, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self.kernel_size = kernel_size
-        self.conv = layers.Conv2D(1, kernel_size, padding="same", activation="sigmoid")
+    def __init__(self, kernel_size: int = 7) -> None:
+        super().__init__()
+        padding = 3 if kernel_size == 7 else 1
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
     
-    def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        avg = tf.reduce_mean(inputs, axis=-1, keepdims=True)
-        max_pool = tf.reduce_max(inputs, axis=-1, keepdims=True)
-        concat = tf.concat([avg, max_pool], axis=-1)
-        spatial_out = self.conv(concat)
-        return inputs * spatial_out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        spatial_out = self.sigmoid(self.conv(x_cat))
+        return x * spatial_out
 
 
-class CBAM(layers.Layer):
+class CBAM(nn.Module):
     """Convolutional Block Attention Module (Channel + Spatial)."""
     
-    def __init__(self, reduction: int = 16, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self.channel_att = ChannelAttention(reduction=reduction)
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        self.channel_att = ChannelAttention(channels, reduction=reduction)
         self.spatial_att = SpatialAttention()
     
-    def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        x = self.channel_att(inputs)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.channel_att(x)
         x = self.spatial_att(x)
         return x
 
 
-class BoundingBoxMetric(keras.metrics.Metric):
-    """Mean CIoU metric for normalized boxes."""
-
-    def __init__(self, name: str = "mean_ciou", **kwargs: object) -> None:
-        super().__init__(name=name, **kwargs)
-        self.total = self.add_weight(name="total", initializer="zeros")
-        self.count = self.add_weight(name="count", initializer="zeros")
-
-    def update_state(self, y_true: tf.Tensor, y_pred: tf.Tensor, sample_weight: Optional[tf.Tensor] = None) -> None:
-        ciou = box_ciou(y_true, y_pred)
-        self.total.assign_add(tf.reduce_sum(ciou))
-        self.count.assign_add(tf.cast(tf.size(ciou), tf.float32))
-
-    def result(self) -> tf.Tensor:
-        return tf.math.divide_no_nan(self.total, self.count)
-
-    def reset_state(self) -> None:
-        self.total.assign(0.0)
-        self.count.assign(0.0)
-
-
-class BoxRegressionLoss(keras.losses.Loss):
+class BoxRegressionLoss(nn.Module):
     """Complete IoU (CIoU) loss - better for bbox regression."""
 
-    def __init__(self, name: str = "ciou_loss") -> None:
-        super().__init__(name=name)
+    def __init__(self) -> None:
+        super().__init__()
 
-    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
         ciou = box_ciou(y_true, y_pred)
-        return 1.0 - ciou
+        return torch.mean(1.0 - ciou)
 
 
-def create_optimizer(learning_rate: float, weight_decay: float = 1e-5) -> keras.optimizers.Optimizer:
-    """Create AdamW optimizer when available, fallback to Adam."""
-    try:
-        return keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay, clipnorm=1.0)
-    except AttributeError:
-        return keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
+def create_optimizer(model: nn.Module, learning_rate: float, weight_decay: float = 1e-5) -> torch.optim.Optimizer:
+    """Create AdamW optimizer."""
+    return torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 
-class LicensePlateDetectionModel:
+class LicensePlateDetectionModel(nn.Module):
     """EfficientNetV2 + FPN + CBAM + Dense head for plate localization."""
 
-    def __init__(self, input_shape: Tuple[int, int, int] = (320, 320, 3)) -> None:
+    def __init__(self, input_shape: Tuple[int, int, int] = (320, 320, 3), device: torch.device | None = None) -> None:
+        super().__init__()
         self.input_shape = input_shape
-        self.backbone: Optional[keras.Model] = None
-        self.model: Optional[keras.Model] = None
-
-    def _build_fpn(self, backbone_outputs: list[tf.Tensor], fpn_channels: int = 256) -> tf.Tensor:
-        """Build simplified FPN by pooling multi-scale features separately."""
-        # Process each scale independently
-        fpn_features = []
+        self.device = device or (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.backbone: Optional[nn.Module] = None
         
-        for i, backbone_out in enumerate(backbone_outputs):
-            # 1×1 convolution to standardize channels
-            x = layers.Conv2D(fpn_channels, 1, padding="same", name=f"fpn_conv_{i}")(backbone_out)
-            
-            # Refine with 3×3 convolution
-            x = layers.Conv2D(fpn_channels, 3, padding="same", activation="relu", name=f"fpn_refine_{i}")(x)
-            
-            # Global average pooling to get fixed-size feature
-            x = layers.GlobalAveragePooling2D(name=f"fpn_pool_{i}")(x)
-            fpn_features.append(x)
+        # Build layers
+        self._build_backbone()
+        self._build_fpn()
+        self._build_head()
         
-        # Concatenate all scale features
-        merged = layers.Concatenate(name="fpn_concat")(fpn_features)
-        return merged
+        self.to(self.device)
 
-    def build(self, fine_tune_at: int = 180) -> keras.Model:
-        """Build model with FPN + CBAM + CIoU loss."""
-        inputs = layers.Input(shape=self.input_shape)
+    def _build_backbone(self) -> None:
+        """Build EfficientNetV2L backbone."""
+        # Load pretrained EfficientNetV2L
+        efficientnet = models.efficientnet_v2_l(weights=models.EfficientNet_V2_L_Weights.IMAGENET1K_V1)
+        
+        # Remove classification head
+        self.backbone = nn.Sequential(*list(efficientnet.children())[:-1])
 
-        # Data augmentation
-        x = layers.RandomBrightness(factor=0.2)(inputs)
-        x = layers.RandomContrast(factor=0.2)(x)
-        x = layers.RandomRotation(factor=0.1)(x)
-        x = layers.RandomZoom(height_factor=(-0.1, 0.1), width_factor=(-0.1, 0.1))(x)
+    def _build_fpn(self) -> None:
+        """Build FPN head."""
+        # efficientnet_v2_l outputs 1280 channels at final layer
+        self.fpn_conv = nn.Conv2d(1280, 256, kernel_size=1, padding=0)
+        self.fpn_refine = nn.Conv2d(256, 256, kernel_size=3, padding=1)
 
-        # Backbone: EfficientNetV2B2 (larger than B0)
-        backbone = keras.applications.EfficientNetV2B2(
-            include_top=False,
-            weights="imagenet",
-            input_shape=self.input_shape,
+    def _build_head(self) -> None:
+        """Build detection head."""
+        # CBAM on 256 channels
+        self.cbam = CBAM(256, reduction=16)
+        
+        # Dense head - input is 256 (from global avg pool)
+        self.head = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.Linear(256, 128),
+            nn.SiLU(inplace=True),
+            nn.Dropout(0.4),
+            
+            nn.LayerNorm(128),
+            nn.Linear(128, 64),
+            nn.SiLU(inplace=True),
+            nn.Dropout(0.3),
+            
+            nn.Linear(64, 4),
+            nn.Sigmoid(),  # Output normalized [0, 1] for bbox
         )
-        backbone.trainable = False
-        self.backbone = backbone
 
-        # Get intermediate layers for FPN
-        layer_names = ["block2b_add", "block4a_expand_activation", "top_activation"]
-        backbone_outputs = [backbone.get_layer(name).output for name in layer_names]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        # Get backbone features [B, 1280, 10, 10]
+        features = self.backbone[0](x)
         
-        # Create intermediate model
-        intermediate_model = keras.Model(inputs=backbone.input, outputs=backbone_outputs)
-        intermediate_outputs = intermediate_model(x)
-
-        # FPN
-        fpn_features = self._build_fpn(intermediate_outputs, fpn_channels=256)
-
-        # CBAM attention
-        x = layers.Dense(512, activation="swish")(fpn_features)
-        x = layers.Reshape((1, 1, 512))(x)
-        x = CBAM(reduction=16)(x)
-        x = layers.Flatten()(x)
-
-        # Dense head
-        x = layers.LayerNormalization()(x)
-        x = layers.Dense(512, activation="swish")(x)
-        x = layers.Dropout(0.4)(x)
+        # FPN: 1x1 conv to reduce channels
+        feat = self.fpn_conv(features)
+        feat = self.fpn_refine(feat)
         
-        x = layers.LayerNormalization()(x)
-        x = layers.Dense(256, activation="swish")(x)
-        x = layers.Dropout(0.3)(x)
+        # Global average pooling [B, 256, 1, 1] -> [B, 256]
+        feat = F.adaptive_avg_pool2d(feat, (1, 1))
+        feat = feat.view(feat.size(0), -1)
         
-        x = layers.LayerNormalization()(x)
-        x = layers.Dense(128, activation="swish")(x)
-        x = layers.Dropout(0.2)(x)
+        # CBAM (reshape to spatial, apply, reshape back)
+        feat_spatial = feat.view(feat.size(0), 256, 1, 1)
+        feat_spatial = self.cbam(feat_spatial)
+        feat = feat_spatial.view(feat_spatial.size(0), -1)
+        
+        # Dense head for bbox regression
+        bbox = self.head(feat)
+        return bbox
 
-        # Output: corner format [xmin, ymin, xmax, ymax]
-        bbox = layers.Dense(4, activation="sigmoid", name="bbox")(x)
-
-        self.model = keras.Model(inputs=inputs, outputs=bbox, name="plate_detector_fpn_cbam")
-        self._unfreeze_top_layers(fine_tune_at)
-        return self.model
-
-    def _unfreeze_top_layers(self, fine_tune_at: int) -> None:
-        if self.backbone is None:
-            return
-
-        self.backbone.trainable = True
-        for layer in self.backbone.layers[:fine_tune_at]:
-            layer.trainable = False
-
-    def set_backbone_trainable(self, trainable: bool, fine_tune_at: int = 180) -> None:
+    def freeze_backbone(self, freeze: bool = True) -> None:
         """Freeze or unfreeze backbone."""
-        if self.backbone is None:
-            return
+        for param in self.backbone.parameters():
+            param.requires_grad = not freeze
 
-        self.backbone.trainable = trainable
-        if trainable:
-            for layer in self.backbone.layers[:fine_tune_at]:
-                layer.trainable = False
-
-    def compile(
-        self,
-        optimizer: Optional[keras.optimizers.Optimizer] = None,
-        loss: Optional[keras.losses.Loss] = None,
-        metrics: Optional[list[keras.metrics.Metric | str]] = None,
-    ) -> None:
-        """Compile model."""
-        if self.model is None:
-            raise ValueError("Build model first.")
-
-        if optimizer is None:
-            optimizer = create_optimizer(learning_rate=1e-4)
-        if loss is None:
-            loss = BoxRegressionLoss()
-        if metrics is None:
-            metrics = [BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name="mae")]
-
-        self.model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
-
-    def train(
-        self,
-        x_train: np.ndarray,
-        y_train: np.ndarray,
-        x_val: Optional[np.ndarray] = None,
-        y_val: Optional[np.ndarray] = None,
-        sample_weight: Optional[np.ndarray] = None,
-        epochs: int = 50,
-        batch_size: int = 16,
-        callbacks: Optional[list[keras.callbacks.Callback]] = None,
-    ) -> keras.callbacks.History:
-        """Train model."""
-        if self.model is None:
-            raise ValueError("Build model first.")
-
-        if callbacks is None:
-            callbacks = [
-                keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
-                keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6),
-            ]
-
-        return self.model.fit(
-            x_train,
-            y_train,
-            sample_weight=sample_weight,
-            validation_data=(x_val, y_val) if x_val is not None and y_val is not None else None,
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=1,
-        )
-
-    def predict(self, images: np.ndarray) -> np.ndarray:
-        """Predict normalized boxes."""
-        if self.model is None:
-            raise ValueError("Build or load model first.")
-        return self.model.predict(images, verbose=0)
+    def freeze_top_layers(self, fine_tune_at: int) -> None:
+        """Freeze layers up to fine_tune_at."""
+        layer_count = 0
+        for param in self.backbone.parameters():
+            if layer_count < fine_tune_at:
+                param.requires_grad = False
+                layer_count += 1
+            else:
+                param.requires_grad = True
 
     def save(self, filepath: str) -> None:
         """Save model to disk."""
-        if self.model is None:
-            raise ValueError("Build model first.")
-        self.model.save(filepath)
+        torch.save({
+            'model_state_dict': self.state_dict(),
+            'model_config': {
+                'input_shape': self.input_shape,
+            }
+        }, filepath)
+        print(f"Model saved to {filepath}")
 
     def load(self, filepath: str) -> None:
         """Load model from disk."""
-        self.model = keras.models.load_model(
-            filepath,
-            compile=False,
-            custom_objects={
-                "BoxRegressionLoss": BoxRegressionLoss,
-                "BoundingBoxMetric": BoundingBoxMetric,
-                "ChannelAttention": ChannelAttention,
-                "SpatialAttention": SpatialAttention,
-                "CBAM": CBAM,
-            },
-        )
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.load_state_dict(checkpoint['model_state_dict'])
+        self.to(self.device)
+        print(f"Model loaded from {filepath}")
 
     def get_summary(self) -> None:
         """Print model summary."""
-        if self.model is None:
-            raise ValueError("Build or load model first.")
-        self.model.summary()
+        print(f"Model: LicensePlateDetectionModel")
+        print(f"Device: {self.device}")
+        print(f"Input shape: {self.input_shape}")
+        print(f"Total parameters: {sum(p.numel() for p in self.parameters()):,}")
+        print(f"Trainable parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")

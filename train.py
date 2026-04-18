@@ -1,8 +1,10 @@
-"""Type-safe training script for license plate detection with 3-phase training."""
+"""PyTorch training script for license plate detection with 3-phase training."""
 
 from typing import Tuple
 import numpy as np
-from tensorflow import keras
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -10,7 +12,7 @@ from dataset_loader import LicensePlateDataset
 from model import (
     LicensePlateDetectionModel,
     BoxRegressionLoss,
-    BoundingBoxMetric,
+    box_ciou,
     create_optimizer,
 )
 
@@ -38,59 +40,116 @@ def make_area_bins(bboxes: np.ndarray, num_bins: int = 5) -> np.ndarray:
     return np.digitize(areas, edges[1:-1], right=False).astype(np.int32)
 
 
-def visualize_predictions(
-    images: np.ndarray,
-    true_bboxes: np.ndarray,
-    pred_bboxes: np.ndarray,
-    num_samples: int = 3
+
+class PlateDataset(Dataset):
+    """PyTorch Dataset for license plate detection."""
+    
+    def __init__(self, images: np.ndarray, bboxes: np.ndarray, weights: np.ndarray | None = None):
+        # Transpose from HWC to CHW format
+        images_chw = np.transpose(images, (0, 3, 1, 2))
+        self.images = torch.tensor(images_chw, dtype=torch.float32)
+        self.bboxes = torch.tensor(bboxes, dtype=torch.float32)
+        self.weights = torch.tensor(weights, dtype=torch.float32) if weights is not None else None
+    
+    def __len__(self) -> int:
+        return len(self.images)
+    
+    def __getitem__(self, idx: int) -> tuple:
+        if self.weights is not None:
+            return self.images[idx], self.bboxes[idx], self.weights[idx]
+        return self.images[idx], self.bboxes[idx]
+
+
+def train_phase(
+    model: nn.Module,
+    device: torch.device,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    phase_name: str,
 ) -> None:
-    """Visualize predictions vs ground truth."""
+    """Train model for one phase."""
+    print(f"\n{phase_name}: Training for {epochs} epochs...")
     
-    fig, axes = plt.subplots(num_samples, 2, figsize=(12, 4 * num_samples))
+    best_val_ciou = -float('inf')
+    patience_counter = 0
+    patience = 10
     
-    for i in range(min(num_samples, len(images))):
-        img = (images[i] * 255).astype(np.uint8)
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_ciou = 0.0
         
-        # True bbox
-        ax_true = axes[i, 0]
-        ax_true.imshow(img)
-        true_bbox = true_bboxes[i]
-        h, w = img.shape[:2]
-        rect_true = plt.Rectangle(
-            (true_bbox[0] * w, true_bbox[1] * h),
-            (true_bbox[2] - true_bbox[0]) * w,
-            (true_bbox[3] - true_bbox[1]) * h,
-            linewidth=2, edgecolor='green', facecolor='none'
-        )
-        ax_true.add_patch(rect_true)
-        ax_true.set_title('Ground Truth')
-        ax_true.axis('off')
+        for batch_idx, batch_data in enumerate(train_loader):
+            images = batch_data[0].to(device)
+            bboxes = batch_data[1].to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(bboxes, outputs)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            with torch.no_grad():
+                ciou = torch.mean(box_ciou(bboxes, outputs))
+                train_ciou += ciou.item()
+            
+            if (batch_idx + 1) % max(1, len(train_loader) // 5) == 0:
+                print(f"  Epoch [{epoch+1}/{epochs}] Batch [{batch_idx+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
         
-        # Predicted bbox
-        ax_pred = axes[i, 1]
-        ax_pred.imshow(img)
-        pred_bbox = pred_bboxes[i]
-        rect_pred = plt.Rectangle(
-            (pred_bbox[0] * w, pred_bbox[1] * h),
-            (pred_bbox[2] - pred_bbox[0]) * w,
-            (pred_bbox[3] - pred_bbox[1]) * h,
-            linewidth=2, edgecolor='red', facecolor='none'
-        )
-        ax_pred.add_patch(rect_pred)
-        ax_pred.set_title('Prediction')
-        ax_pred.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig('predictions.png', dpi=100)
-    print("Saved predictions.png")
-    plt.close()
+        train_loss /= len(train_loader)
+        train_ciou /= len(train_loader)
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_ciou = 0.0
+        
+        with torch.no_grad():
+            for images, bboxes in val_loader:
+                images = images.to(device)
+                bboxes = bboxes.to(device)
+                
+                outputs = model(images)
+                loss = criterion(bboxes, outputs)
+                
+                val_loss += loss.item()
+                ciou = torch.mean(box_ciou(bboxes, outputs))
+                val_ciou += ciou.item()
+        
+        val_loss /= len(val_loader)
+        val_ciou /= len(val_loader)
+        
+        print(f"Epoch [{epoch+1}/{epochs}] Train Loss: {train_loss:.4f}, Train CIoU: {train_ciou:.4f}, "
+              f"Val Loss: {val_loss:.4f}, Val CIoU: {val_ciou:.4f}")
+        
+        # Early stopping
+        if val_ciou > best_val_ciou:
+            best_val_ciou = val_ciou
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping after {epoch+1} epochs")
+                break
 
 
 def main() -> None:
     """Main training pipeline with 3-phase strategy."""
     
-    print("=== License Plate Detection - Enhanced Training (FPN + CBAM + CIoU) ===\n")
+    print("=== License Plate Detection - PyTorch Training (FPN + CBAM + CIoU) ===\n")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Detect device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB\n")
     
     # Load dataset
     print("1. Loading dataset...")
@@ -122,180 +181,99 @@ def main() -> None:
 
     train_weights = compute_area_weights(y_train)
     
+    # Create datasets and dataloaders
+    train_dataset = PlateDataset(x_train, y_train, train_weights)
+    val_dataset = PlateDataset(x_val, y_val)
+    test_dataset = PlateDataset(x_test, y_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    
     # Build model
     print("\n3. Building model with FPN + CBAM...")
-    detector = LicensePlateDetectionModel(input_shape=(320, 320, 3))
-    detector.build()
+    detector = LicensePlateDetectionModel(input_shape=(320, 320, 3), device=device)
     detector.get_summary()
+    
+    # Loss and optimizer
+    criterion = BoxRegressionLoss()
     
     # ===== PHASE 1: Warmup + Head Training (frozen backbone) =====
     print("\n" + "="*60)
     print("PHASE 1: Training Head with Frozen Backbone (Warmup)")
     print("="*60)
     
-    detector.set_backbone_trainable(False)
-    detector.compile(
-        optimizer=create_optimizer(learning_rate=2e-4),
-        loss=BoxRegressionLoss(),
-        metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
-    )
-
-    phase1_callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_mean_ciou",
-            mode="max",
-            patience=8,
-            restore_best_weights=True,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_mean_ciou",
-            mode="max",
-            factor=0.5,
-            patience=2,
-            min_lr=1e-6,
-            verbose=1,
-        ),
-        keras.callbacks.ModelCheckpoint(
-            f"license_plate_detector_phase1_{timestamp}.keras",
-            monitor="val_mean_ciou",
-            mode="max",
-            save_best_only=True,
-            verbose=1,
-        ),
-    ]
-    
-    print("\nPhase 1: Training head (20 epochs with aggressive augmentation)...")
-    detector.train(
-        x_train, y_train,
-        x_val=x_val, y_val=y_val,
-        sample_weight=train_weights,
-        epochs=20,
-        batch_size=16,
-        callbacks=phase1_callbacks,
-    )
+    detector.freeze_backbone(freeze=True)
+    optimizer = create_optimizer(detector, learning_rate=2e-4)
+    train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=20, phase_name="Phase 1")
+    detector.save(f"license_plate_detector_phase1_{timestamp}.pt")
 
     # ===== PHASE 2: Fine-tune Top Backbone Layers =====
     print("\n" + "="*60)
     print("PHASE 2: Fine-tuning Top Backbone Layers")
     print("="*60)
     
-    detector.set_backbone_trainable(True, fine_tune_at=200)
-    detector.compile(
-        optimizer=create_optimizer(learning_rate=5e-5),
-        loss=BoxRegressionLoss(),
-        metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
-    )
-
-    phase2_callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_mean_ciou",
-            mode="max",
-            patience=10,
-            restore_best_weights=True,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_mean_ciou",
-            mode="max",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
-            verbose=1,
-        ),
-        keras.callbacks.ModelCheckpoint(
-            f"license_plate_detector_phase2_{timestamp}.keras",
-            monitor="val_mean_ciou",
-            mode="max",
-            save_best_only=True,
-            verbose=1,
-        ),
-    ]
-
-    print("\nPhase 2: Fine-tuning backbone (30 epochs)...")
-    detector.train(
-        x_train,
-        y_train,
-        x_val=x_val,
-        y_val=y_val,
-        sample_weight=train_weights,
-        epochs=30,
-        batch_size=16,
-        callbacks=phase2_callbacks,
-    )
+    detector.freeze_top_layers(fine_tune_at=200)
+    optimizer = create_optimizer(detector, learning_rate=5e-5)
+    train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=30, phase_name="Phase 2")
+    detector.save(f"license_plate_detector_phase2_{timestamp}.pt")
 
     # ===== PHASE 3: Full Network Fine-tuning =====
     print("\n" + "="*60)
     print("PHASE 3: Full Network Fine-tuning with Lower LR")
     print("="*60)
     
-    detector.set_backbone_trainable(True, fine_tune_at=100)
-    detector.compile(
-        optimizer=create_optimizer(learning_rate=1e-5),
-        loss=BoxRegressionLoss(),
-        metrics=[BoundingBoxMetric(), keras.metrics.MeanAbsoluteError(name='mae')],
-    )
-
-    phase3_callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_mean_ciou",
-            mode="max",
-            patience=12,
-            restore_best_weights=True,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_mean_ciou",
-            mode="max",
-            factor=0.5,
-            patience=4,
-            min_lr=5e-7,
-            verbose=1,
-        ),
-        keras.callbacks.ModelCheckpoint(
-            f"license_plate_detector_phase3_{timestamp}.keras",
-            monitor="val_mean_ciou",
-            mode="max",
-            save_best_only=True,
-            verbose=1,
-        ),
-    ]
-
-    print("\nPhase 3: Full network fine-tuning (25 epochs)...")
-    detector.train(
-        x_train,
-        y_train,
-        x_val=x_val,
-        y_val=y_val,
-        sample_weight=train_weights,
-        epochs=25,
-        batch_size=16,
-        callbacks=phase3_callbacks,
-    )
+    detector.freeze_top_layers(fine_tune_at=100)
+    optimizer = create_optimizer(detector, learning_rate=1e-5)
+    train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=25, phase_name="Phase 3")
+    detector.save(f"license_plate_detector_phase3_{timestamp}.pt")
     
     # Evaluate
     print("\n" + "="*60)
     print("EVALUATION")
     print("="*60)
-    test_loss, test_ciou, test_mae = detector.model.evaluate(x_test, y_test, verbose=0)
+    
+    detector.eval()
+    test_loss = 0.0
+    test_ciou = 0.0
+    
+    with torch.no_grad():
+        for images, bboxes in test_loader:
+            images = images.to(device)
+            bboxes = bboxes.to(device)
+            
+            outputs = detector(images)
+            loss = criterion(bboxes, outputs)
+            
+            test_loss += loss.item()
+            ciou = torch.mean(box_ciou(bboxes, outputs))
+            test_ciou += ciou.item()
+    
+    test_loss /= len(test_loader)
+    test_ciou /= len(test_loader)
+    
     print(f"\nTest Loss: {test_loss:.4f}")
     print(f"Test CIoU: {test_ciou:.4f}")
-    print(f"Test MAE: {test_mae:.4f}")
     
     # Save final model
     print("\n7. Saving final model...")
-    detector.save('license_plate_detector.keras')
+    detector.save('license_plate_detector.pt')
     
     # Visualize predictions
     print("\n8. Visualizing predictions...")
-    pred_test = detector.predict(x_test)
+    with torch.no_grad():
+        pred_test = detector(torch.tensor(x_test, dtype=torch.float32).to(device))
+    pred_test = pred_test.cpu().numpy()
     visualize_predictions(x_test, y_test, pred_test, num_samples=5)
     
     print("\n" + "="*60)
     print("=== Training Complete ===")
     print("="*60)
-    print(f"Model saved as: license_plate_detector.keras")
-    print(f"Checkpoint models: license_plate_detector_phase*.keras")
+    print(f"Model saved as: license_plate_detector.pt")
+    print(f"Checkpoint models: license_plate_detector_phase*.pt")
     print("\nRun inference with:")
     print("  from inference import PlateDetector")
-    print("  detector = PlateDetector('license_plate_detector.keras')")
+    print("  detector = PlateDetector('license_plate_detector.pt')")
     print("  detector.detect_and_draw('image.jpg', 'output.jpg')")
 
 
