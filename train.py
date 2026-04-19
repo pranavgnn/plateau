@@ -70,6 +70,95 @@ def find_latest_checkpoint(pattern: str) -> Optional[str]:
     return str(max(checkpoints, key=lambda p: p.stat().st_mtime))
 
 
+def show_training_menu() -> Tuple[str, list]:
+    """Show interactive menu to choose training mode and phases.
+    
+    Returns:
+        Tuple of (mode, phases_to_run) where:
+        - mode: 'fresh', 'resume', or 'custom'
+        - phases_to_run: list of phases to execute (e.g., [1, 2, 3])
+    """
+    print("\n" + "="*60)
+    print("TRAINING MODE SELECTION")
+    print("="*60)
+    
+    # Check for existing checkpoints
+    phase1_exists = find_latest_checkpoint("license_plate_detector_phase1_*.pt") is not None
+    phase2_exists = find_latest_checkpoint("license_plate_detector_phase2_*.pt") is not None
+    phase3_exists = find_latest_checkpoint("license_plate_detector_phase3_*.pt") is not None
+    
+    print("\nCheckpoint Status:")
+    print(f"  Phase 1: {'✓ Found' if phase1_exists else '✗ Not found'}")
+    print(f"  Phase 2: {'✓ Found' if phase2_exists else '✗ Not found'}")
+    print(f"  Phase 3: {'✓ Found' if phase3_exists else '✗ Not found'}")
+    
+    print("\n\nTraining Modes:")
+    print("  1. Start Fresh (delete all checkpoints, train from scratch)")
+    print("  2. Resume Training (auto-detect checkpoint, continue from there)")
+    print("  3. Custom Phase Selection (choose specific phases to run)")
+    
+    while True:
+        choice = input("\nSelect mode (1-3): ").strip()
+        if choice in ['1', '2', '3']:
+            break
+        print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    if choice == '1':
+        # Start fresh - confirm deletion
+        confirm = input("\n⚠️  This will DELETE all checkpoints. Continue? (y/n): ").strip().lower()
+        if confirm == 'y':
+            for checkpoint in Path(".").glob("license_plate_detector_phase*.pt"):
+                checkpoint.unlink()
+                print(f"Deleted: {checkpoint}")
+            print("✓ All checkpoints deleted. Starting fresh training...")
+            return 'fresh', [1, 2, 3]
+        else:
+            print("✗ Operation cancelled. Exiting.")
+            return None, None
+    
+    elif choice == '2':
+        # Resume - determine starting phase
+        if phase3_exists:
+            print("\n✓ Training already complete (Phase 3 found).")
+            resume_choice = input("Run evaluation only? (y/n): ").strip().lower()
+            if resume_choice == 'y':
+                return 'resume', [0]  # 0 means evaluation only
+            else:
+                return 'resume', []  # Empty list means skip to evaluation
+        elif phase2_exists:
+            print("\n✓ Resuming from Phase 3...")
+            return 'resume', [3]
+        elif phase1_exists:
+            print("\n✓ Resuming from Phase 2...")
+            return 'resume', [2, 3]
+        else:
+            print("\n✓ No checkpoints found. Starting fresh...")
+            return 'fresh', [1, 2, 3]
+    
+    else:  # choice == '3'
+        # Custom phase selection
+        print("\n\nPhase Details:")
+        print("  Phase 1: Warmup - Train head with frozen backbone (20 epochs)")
+        print("  Phase 2: Fine-tune top backbone layers (30 epochs)")
+        print("  Phase 3: Full network fine-tuning with lower LR (25 epochs)")
+        
+        phases_to_run = []
+        for phase_num in [1, 2, 3]:
+            include = input(f"\nInclude Phase {phase_num}? (y/n): ").strip().lower()
+            if include == 'y':
+                phases_to_run.append(phase_num)
+        
+        if not phases_to_run:
+            print("✗ No phases selected. Exiting.")
+            return None, None
+        
+        # Warn about skipping earlier phases
+        if 1 not in phases_to_run and (2 in phases_to_run or 3 in phases_to_run):
+            print("\n⚠️  Warning: Skipping Phase 1. Model may not train well.")
+        
+        return 'custom', phases_to_run
+
+
 def train_phase(
     model: nn.Module,
     device: torch.device,
@@ -151,12 +240,18 @@ def train_phase(
 def main() -> None:
     """Main training pipeline with 3-phase strategy."""
     
-    print("=== License Plate Detection - PyTorch Training (FPN + CBAM + CIoU) ===\n")
+    print("=== License Plate Detection - PyTorch Training (FPN + CBAM + CIoU) ===")
+    
+    # Show training menu and get user choice
+    mode, phases_to_run = show_training_menu()
+    if mode is None:
+        return
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Detect device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"\nUsing device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB\n")
@@ -208,28 +303,25 @@ def main() -> None:
     # Loss and optimizer
     criterion = BoxRegressionLoss()
     
-    # Determine which phase to start from
-    phase3_checkpoint = find_latest_checkpoint("license_plate_detector_phase3_*.pt")
-    phase2_checkpoint = find_latest_checkpoint("license_plate_detector_phase2_*.pt")
-    phase1_checkpoint = find_latest_checkpoint("license_plate_detector_phase1_*.pt")
+    # Determine which phase to start from based on mode
+    phase3_checkpoint = find_latest_checkpoint("license_plate_detector_phase3_*.pt") if mode != 'fresh' else None
+    phase2_checkpoint = find_latest_checkpoint("license_plate_detector_phase2_*.pt") if mode != 'fresh' else None
+    phase1_checkpoint = find_latest_checkpoint("license_plate_detector_phase1_*.pt") if mode != 'fresh' else None
     
-    if phase3_checkpoint:
-        print("\n⚠️  Phase 3 checkpoint found. Training already complete!")
-        print(f"Using: {phase3_checkpoint}")
-        detector.load(phase3_checkpoint)
-    elif phase2_checkpoint:
-        print("\n⚠️  Phase 2 checkpoint found. Resuming from Phase 3...")
-        print(f"Loading: {phase2_checkpoint}")
-        detector.load(phase2_checkpoint)
-    elif phase1_checkpoint:
-        print("\n⚠️  Phase 1 checkpoint found. Resuming from Phase 2...")
-        print(f"Loading: {phase1_checkpoint}")
-        detector.load(phase1_checkpoint)
-    else:
-        print("\n✓ No checkpoints found. Starting fresh training...")
+    # Load appropriate checkpoint for resume mode
+    if mode == 'resume':
+        if phase3_checkpoint:
+            print(f"\nLoading Phase 3 checkpoint: {phase3_checkpoint}")
+            detector.load(phase3_checkpoint)
+        elif phase2_checkpoint:
+            print(f"\nLoading Phase 2 checkpoint: {phase2_checkpoint}")
+            detector.load(phase2_checkpoint)
+        elif phase1_checkpoint:
+            print(f"\nLoading Phase 1 checkpoint: {phase1_checkpoint}")
+            detector.load(phase1_checkpoint)
     
     # ===== PHASE 1: Warmup + Head Training (frozen backbone) =====
-    if not phase1_checkpoint:
+    if 1 in phases_to_run:
         print("\n" + "="*60)
         print("PHASE 1: Training Head with Frozen Backbone (Warmup)")
         print("="*60)
@@ -239,11 +331,9 @@ def main() -> None:
         train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=20, phase_name="Phase 1")
         detector.save(f"license_plate_detector_phase1_{timestamp}.pt")
         phase1_checkpoint = f"license_plate_detector_phase1_{timestamp}.pt"
-    else:
-        print("\n⊘ Skipping Phase 1 (already completed)")
 
     # ===== PHASE 2: Fine-tune Top Backbone Layers =====
-    if not phase2_checkpoint:
+    if 2 in phases_to_run:
         print("\n" + "="*60)
         print("PHASE 2: Fine-tuning Top Backbone Layers")
         print("="*60)
@@ -253,11 +343,9 @@ def main() -> None:
         train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=30, phase_name="Phase 2")
         detector.save(f"license_plate_detector_phase2_{timestamp}.pt")
         phase2_checkpoint = f"license_plate_detector_phase2_{timestamp}.pt"
-    else:
-        print("\n⊘ Skipping Phase 2 (already completed)")
 
     # ===== PHASE 3: Full Network Fine-tuning =====
-    if not phase3_checkpoint:
+    if 3 in phases_to_run:
         print("\n" + "="*60)
         print("PHASE 3: Full Network Fine-tuning with Lower LR")
         print("="*60)
@@ -266,46 +354,47 @@ def main() -> None:
         optimizer = create_optimizer(detector, learning_rate=1e-5)
         train_phase(detector, device, train_loader, val_loader, criterion, optimizer, epochs=25, phase_name="Phase 3")
         detector.save(f"license_plate_detector_phase3_{timestamp}.pt")
-    else:
-        print("\n⊘ Skipping Phase 3 (already completed)")
     
-    # Evaluate
-    print("\n" + "="*60)
-    print("EVALUATION")
-    print("="*60)
-    
-    detector.eval()
-    test_loss = 0.0
-    test_ciou = 0.0
-    
-    with torch.no_grad():
-        for images, bboxes in test_loader:
-            images = images.to(device)
-            bboxes = bboxes.to(device)
-            
-            outputs = detector(images)
-            loss = criterion(bboxes, outputs)
-            
-            test_loss += loss.item()
-            ciou = torch.mean(box_ciou(bboxes, outputs))
-            test_ciou += ciou.item()
-    
-    test_loss /= len(test_loader)
-    test_ciou /= len(test_loader)
-    
-    print(f"\nTest Loss: {test_loss:.4f}")
-    print(f"Test CIoU: {test_ciou:.4f}")
-    
-    # Save final model
-    print("\n7. Saving final model...")
-    detector.save('license_plate_detector.pt')
-    
-    # Visualize predictions
-    print("\n8. Visualizing predictions...")
-    with torch.no_grad():
-        pred_test = detector(torch.tensor(x_test, dtype=torch.float32).to(device))
-    pred_test = pred_test.cpu().numpy()
-    visualize_predictions(x_test, y_test, pred_test, num_samples=5)
+    # Evaluate (skip if no phases were run)
+    if not phases_to_run or 0 in phases_to_run or any(p in [1, 2, 3] for p in phases_to_run):
+        print("\n" + "="*60)
+        print("EVALUATION")
+        print("="*60)
+        
+        detector.eval()
+        test_loss = 0.0
+        test_ciou = 0.0
+        
+        with torch.no_grad():
+            for images, bboxes in test_loader:
+                images = images.to(device)
+                bboxes = bboxes.to(device)
+                
+                outputs = detector(images)
+                loss = criterion(bboxes, outputs)
+                
+                test_loss += loss.item()
+                ciou = torch.mean(box_ciou(bboxes, outputs))
+                test_ciou += ciou.item()
+        
+        test_loss /= len(test_loader)
+        test_ciou /= len(test_loader)
+        
+        print(f"\nTest Loss: {test_loss:.4f}")
+        print(f"Test CIoU: {test_ciou:.4f}")
+        
+        # Save final model
+        print("\n7. Saving final model...")
+        detector.save('license_plate_detector.pt')
+        
+        # Visualize predictions
+        print("\n8. Visualizing predictions...")
+        with torch.no_grad():
+            # Transpose from HWC to CHW format to match model input expectations
+            x_test_chw = np.transpose(x_test, (0, 3, 1, 2))
+            pred_test = detector(torch.tensor(x_test_chw, dtype=torch.float32).to(device))
+        pred_test = pred_test.cpu().numpy()
+        visualize_predictions(x_test, y_test, pred_test, num_samples=5)
     
     print("\n" + "="*60)
     print("=== Training Complete ===")

@@ -80,11 +80,34 @@ class PlateDetector:
     
     def __init__(self, model_path: Optional[str] = None, device: torch.device | None = None):
         # Auto-detect best checkpoint if not specified
-        resolved_path = find_best_checkpoint(model_path)
+        try:
+            resolved_path = find_best_checkpoint(model_path)
+        except FileNotFoundError as e:
+            print(f"\n❌ {e}")
+            raise
         
         self.device = device or (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.detector = LicensePlateDetectionModel(device=self.device)
-        self.detector.load(resolved_path)
+        
+        try:
+            self.detector.load(resolved_path)
+        except RuntimeError as e:
+            if "metadata.json" in str(e) or "archive" in str(e):
+                print(f"\n❌ Checkpoint file is corrupted: {resolved_path}")
+                print("\nThis typically happens when training is interrupted during save.")
+                print("\n💡 Solutions:")
+                print("  1. Delete corrupted checkpoints and restart training:")
+                print("     - rm license_plate_detector_*.pt")
+                print("     - python train.py")
+                print("\n  2. Or if you have backups from a git repository:")
+                print("     - git checkout license_plate_detector_*.pt")
+                raise FileNotFoundError(
+                    f"Checkpoint corrupted and cannot be loaded: {resolved_path}\n"
+                    f"Error: {str(e)[:100]}"
+                ) from e
+            else:
+                raise
+        
         self.detector.eval()
         self._tta_scales = [0.85, 1.0, 1.15]
         self._use_tta = True
@@ -297,6 +320,8 @@ def batch_detect(
 
 # Example usage
 if __name__ == "__main__":
+    import os
+    
     # Initialize detector
     model_path = Path("license_plate_detector.pt")
     if not model_path.exists():
@@ -304,13 +329,44 @@ if __name__ == "__main__":
 
     detector = PlateDetector(str(model_path))
     
-    # Single image detection
-    image_path = "path/to/image.png"  # Replace with actual image path
-    try:
-        bbox = detector.detect_and_draw(image_path, "output.png")
-    except Exception as e:
-        print(f"Detection failed: {e}")
+    # Create output directory
+    output_dir = "predictions_output"
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Batch detection (optional)
-    # image_paths = ["img1.png", "img2.png", "img3.png"]
-    # results = batch_detect(detector, image_paths)
+    # Process all images in the images folder
+    images_dir = "images"
+    if not os.path.exists(images_dir):
+        print(f"❌ '{images_dir}' folder not found!")
+        print(f"📁 Please create a '{images_dir}' folder and add images to it.")
+    else:
+        # Get all image files
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.PNG', '.JPEG'}
+        image_files = [
+            f for f in os.listdir(images_dir) 
+            if os.path.splitext(f)[1] in image_extensions
+        ]
+        
+        if not image_files:
+            print(f"❌ No images found in '{images_dir}' folder!")
+            print(f"📷 Please add .jpg, .png, or .bmp images to the '{images_dir}' folder.")
+        else:
+            print(f"✓ Found {len(image_files)} image(s) in '{images_dir}' folder\n")
+            print("Processing...")
+            print("="*60)
+            
+            for image_file in image_files:
+                input_path = os.path.join(images_dir, image_file)
+                output_filename = f"detected_{os.path.splitext(image_file)[0]}.png"
+                output_path = os.path.join(output_dir, output_filename)
+                
+                try:
+                    bbox = detector.detect_and_draw(input_path, output_path)
+                    print(f"✓ {image_file}")
+                    print(f"  → Saved to: {output_path}")
+                    print(f"  → Bbox: {bbox}\n")
+                except Exception as e:
+                    print(f"✗ {image_file}")
+                    print(f"  → Error: {e}\n")
+            
+            print("="*60)
+            print(f"✓ All detections saved to '{output_dir}/' folder")
