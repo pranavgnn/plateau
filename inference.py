@@ -113,11 +113,13 @@ class PlateDetector:
         self._use_tta = True
     
     def _preprocess(self, img_bgr: np.ndarray, target_size: Tuple[int, int]) -> torch.Tensor:
-        """BGR image → normalized RGB tensor [1, H, W, 3]."""
+        """BGR image → normalized RGB tensor [1, C, H, W] (CHW format)."""
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, target_size)
         img = img.astype(np.float32) / 255.0
-        return torch.tensor(np.expand_dims(img, axis=0), dtype=torch.float32).to(self.device)
+        # Transpose from HWC to CHW format
+        img_chw = np.transpose(img, (2, 0, 1))
+        return torch.tensor(np.expand_dims(img_chw, axis=0), dtype=torch.float32).to(self.device)
 
     def _predict_single(self, img_batch: torch.Tensor) -> np.ndarray:
         """Run model on a single [1, H, W, 3] batch and return [4] bbox."""
@@ -140,7 +142,9 @@ class PlateDetector:
             # Center crop / pad to target_size
             img_final = self._center_crop_or_pad(img_scaled, target_size)
             img_norm = img_final.astype(np.float32) / 255.0
-            batch = torch.tensor(np.expand_dims(img_norm, axis=0), dtype=torch.float32).to(self.device)
+            # Transpose from HWC to CHW format
+            img_norm_chw = np.transpose(img_norm, (2, 0, 1))
+            batch = torch.tensor(np.expand_dims(img_norm_chw, axis=0), dtype=torch.float32).to(self.device)
 
             # Original orientation
             pred = self._predict_single(batch)
